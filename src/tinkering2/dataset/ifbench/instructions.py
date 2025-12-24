@@ -28,7 +28,7 @@ from collections import Counter
 import csv
 import io
 
-import instructions_util
+from tinkering2.dataset.ifbench import instructions_util
 
 download('en_core_web_sm')
 

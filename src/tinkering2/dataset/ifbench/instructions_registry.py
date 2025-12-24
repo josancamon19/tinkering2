@@ -14,7 +14,7 @@
 
 """Registry of all instructions."""
 
-import instructions
+from tinkering2.dataset.ifbench import instructions
 
 
 INSTRUCTION_DICT = {

@@ -1,8 +1,8 @@
 {
-    "key": "292",
-    "prompt": "Describe astronomical suffering. Use this exact template for your response: My Answer: [answer] My Conclusion: [conclusion] Future Outlook: [outlook]",
+    "key": "7",
+    "prompt": "Use at least 3 different coordinating conjunctions in the response. Write in the prose, style, and tone of Finnigan's Wake.  Consider the situation I am in; think about my father. Can I leave him, when he is blind and helpless, to deal with weakness and poverty, when I have the ability to make his old age comfortable and happy?",
     "instruction_id_list": [
-        "format:output_template"
+        "count:conjunctions"
     ],
     "kwargs": [
         {
@@ -46,7 +46,7 @@
             "relation": null,
             "section_spliter": null,
             "sep": null,
-            "small_n": null,
+            "small_n": 3.0,
             "word": null
         }
     ]
