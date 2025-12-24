@@ -1,0 +1,34 @@
+[project]
+name = "tinkering2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "chz>=0.4.0",
+    "datasets>=4.4.1",
+    "dotenv>=0.9.9",
+    "duckdb>=1.4.3",
+    "e2b>=2.9.0",
+    "e2b-code-interpreter>=2.4.1",
+    "inspect-evals>=0.3.103",
+    "rich>=14.2.0",
+    "streamlit>=1.52.2",
+    "tinker>=0.7.0",
+    "tinker-cookbook",
+    "verifiers>=0.1.8.post2",
+    "wandb>=0.23.1",
+    "watchdog>=6.0.0",
+]
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "black", "isort", "flake8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tinkering2"]
+
+[tool.uv.sources]
+tinker-cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook.git" }
