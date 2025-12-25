@@ -18,14 +18,18 @@ with open(_HERE / "data.jsonl", "r") as f:
 
 @chz.chz
 class Config:
-    model_name: str = "meta-llama/Llama-3.2-3B"
+    # model_name: str = "meta-llama/Llama-3.2-3B"
+    # model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    # model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
+    model_name: str = "Qwen/Qwen3-32B"
     sample_idx: int = 0
+    run_all: bool = False
 
 
-def single_eval(
+def evaluate_output(
     parsed_response: str,
-    instruction_id_list: str,
-    kwargs,
+    instruction_id_list: list[str],
+    kwargs: list[dict],
 ) -> list[tuple[str, int]]:
     results = []
 
@@ -45,11 +49,7 @@ def single_eval(
     return results, sum(map(lambda x: x[1], results)) / len(results)
 
 
-async def run_for_sample(config: Config):
-    sample = data[config.sample_idx]
-    _, prompt = sample["key"], sample["prompt"]
-    instruction_id_list, kwargs = sample["instruction_id_list"], sample["kwargs"]
-
+async def run_ifbench(config: Config):
     client = tinker.ServiceClient()
     sampling_client = client.create_sampling_client(base_model=config.model_name)
     renderer_name = model_info.get_recommended_renderer_name("meta-llama/Llama-3.2-3B")
@@ -62,23 +62,56 @@ async def run_for_sample(config: Config):
         seed=42,
         stop=renderer.get_stop_sequences(),
     )
+    global data
+    # data = data[:5]
 
-    message = [{"role": "user", "content": prompt}]
-    prompt: tinker.ModelInput = renderer.build_generation_prompt(message)
+    async def single(idx: int) -> tuple[int, float, list[bool], str]:
+        sample = data[idx]
+        _, prompt = sample["key"], sample["prompt"]
+        instruction_id_list, kwargs = sample["instruction_id_list"], sample["kwargs"]
 
-    response = sampling_client.sample_async(prompt, 1, sampling_params)
-    
+        message = [{"role": "user", "content": prompt}]
+        prompt: tinker.ModelInput = renderer.build_generation_prompt(message)
 
+        response = await sampling_client.sample_async(prompt, 1, sampling_params)
+        parsed_response, _ = renderer.parse_response(response.sequences[0].tokens)
 
-    parsed_response, _ = renderer.parse_response(response.sequences[0].tokens)
-    results, score = single_eval(parsed_response["content"], instruction_id_list, kwargs)
+        content = parsed_response["content"]
+        # Strip thinking block for Qwen3 models
+        if "</think>" in content:
+            content = content.split("</think>", 1)[-1].strip()
+        # Also remove any trailing special tokens
+        content = content.replace("<|im_end|>", "").strip()
+        results, score = evaluate_output(content, instruction_id_list, kwargs)
+        return idx, score, results, content
 
-    print(results)
-    print(score)
+    if config.run_all:
+        import asyncio
+
+        tasks = [asyncio.create_task(single(i)) for i in range(len(data))]
+        results = [None] * len(data)
+        for coro in asyncio.as_completed(tasks):
+            idx, score, _results, response = await coro
+            results[idx] = {"score": score, "results": _results, "response": response}
+
+        results_dir = Path("./results")
+        results_dir.mkdir(exist_ok=True)
+        model_filename = config.model_name.split("/")[-1] + ".jsonl"
+
+        with open(results_dir / model_filename, "w") as f:
+            for result in results:
+                f.write(json.dumps(result) + "\n")
+
+        overall_score = sum(r["score"] for r in results) / len(results)
+        print(f"Overall score: {overall_score:.3f}")
+
+    else:
+        await single(config.sample_idx)
 
 
 if __name__ == "__main__":
+
     def run(config: Config) -> None:
-        asyncio.run(run_for_sample(config))
+        asyncio.run(run_ifbench(config))
 
     chz.nested_entrypoint(run, allow_hyphens=True)
