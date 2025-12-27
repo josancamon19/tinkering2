@@ -14,6 +14,7 @@ from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook import model_info, checkpoint_utils
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import ml_log
+from tinker_cookbook.rl.metrics import incorporate_kl_penalty
 from tinker import types
 from tinker.types.tensor_data import TensorData
 from tinkering2.dataset.ifbench.simple_eval import evaluate_output, strip_thinking
@@ -86,7 +87,23 @@ class Config:
     # though this comes at the cost of wasted compute on zero-gradient samples.
     filter_zero_advantage: bool = True
 
-    # TODO: dynamic sampling options, kl penalty as in allen_ai run script
+    # - KL penalty options (uses Tinker's incorporate_kl_penalty)
+    # Computes KL divergence against a frozen base model and adjusts advantages.
+    # This is the mathematically correct way to add KL regularization, as opposed to
+    # adding it directly to the loss function (which is mathematically inconsistent
+    # per Zhang et al., 2025; Tang et al., 2025).
+    #
+    # The KL penalty is computed as: kl = logp_sampled - logp_base
+    # And advantages are adjusted: advantage += coef * (avg_kl - per_token_kl)
+    #
+    # Note: DAPO removes KL penalty entirely since reasoning models need to diverge
+    # significantly from the base model. Consider disabling for reasoning tasks.
+    kl_penalty_coef: float = 0.0  # Set > 0 to enable (e.g., 0.01). 0 = disabled.
+    kl_discount_factor: float = (
+        0.0  # Discount factor for future KL (0 = no discounting)
+    )
+
+    # TODO: dynamic sampling options
     # TODO: offline online async setups
 
 
@@ -111,6 +128,8 @@ def _get_run_name(config: Config) -> str:
         name += "_clip"
         if config.clip_higher:
             name += "-higher"
+    if config.kl_penalty_coef > 0:
+        name += f"_kl{config.kl_penalty_coef}"
     return name
 
 
@@ -275,6 +294,10 @@ async def main(config: Config):
     # Early stopping state
     best_eval_acc = -1.0
     evals_without_improvement = 0
+
+    base_sampling_client = service_client.create_sampling_client(
+        base_model=config.model
+    )
 
     final_step = 0
     for batch_idx, start_idx in enumerate(range(0, len(train_data), config.batch_size)):
@@ -459,20 +482,24 @@ async def main(config: Config):
                     len(input_tokens) - ob_len
                 )
 
+                loss_fn_inputs = {
+                    "target_tokens": TensorData.from_torch(torch.tensor(target_tokens)),
+                    "logprobs": TensorData.from_torch(torch.tensor(all_logprobs)),
+                    "advantages": TensorData.from_torch(torch.tensor(all_advantages)),
+                }
+
+                # Add mask only if using KL penalty (required by incorporate_kl_penalty)
+                # The mask is NOT used by loss functions - Tinker strips it before training
+                if config.kl_penalty_coef > 0:
+                    all_mask = [0.0] * ob_len + [1.0] * (len(input_tokens) - ob_len)
+                    loss_fn_inputs["mask"] = TensorData.from_torch(
+                        torch.tensor(all_mask)
+                    )
+
                 training_datums.append(
                     types.Datum(
                         model_input=types.ModelInput.from_ints(tokens=input_tokens),
-                        loss_fn_inputs={
-                            "target_tokens": TensorData.from_torch(
-                                torch.tensor(target_tokens)
-                            ),
-                            "logprobs": TensorData.from_torch(
-                                torch.tensor(all_logprobs)
-                            ),
-                            "advantages": TensorData.from_torch(
-                                torch.tensor(all_advantages)
-                            ),
-                        },
+                        loss_fn_inputs=loss_fn_inputs,
                     )
                 )
 
@@ -488,6 +515,20 @@ async def main(config: Config):
                 "Consider increasing rollouts for more variance."
             )
             continue
+
+        # Apply KL penalty against base model if configured
+        # This uses Tinker's incorporate_kl_penalty which:
+        # 1. Computes logprobs from frozen base model
+        # 2. Calculates KL = logp_sampled - logp_base per token
+        # 3. Adjusts advantages: advantage += coef * (avg_kl - per_token_kl)
+        kl_metrics: dict[str, float] = {}
+        if config.kl_penalty_coef > 0:
+            kl_metrics = await incorporate_kl_penalty(
+                training_datums,
+                base_sampling_client,
+                config.kl_penalty_coef,
+                config.kl_discount_factor,
+            )
 
         # Choose loss function based on clipping config
         if config.use_clipping:
@@ -515,6 +556,12 @@ async def main(config: Config):
         metrics["reward/mean"] = (
             sum(batch_rewards) / len(batch_rewards) if batch_rewards else 0.0
         )
+
+        # KL penalty metrics (from Tinker's incorporate_kl_penalty)
+        if kl_metrics:
+            metrics.update({f"kl/{k}": v for k, v in kl_metrics.items()})
+            metrics["kl/coef"] = config.kl_penalty_coef
+
         # Forward backward result has a metrics dict, not a loss attribute
         metrics.update({f"train/{k}": v for k, v in fwd_bwd_result.metrics.items()})
         metrics["train/num_datums"] = len(training_datums)
@@ -524,13 +571,19 @@ async def main(config: Config):
             loss_sum / len(training_datums) if training_datums else 0.0
         )
         ml_logger.log_metrics(metrics, step=batch_idx)
-        logger.info(
+
+        # Build log message
+        log_msg = (
             f"Batch {batch_idx}/{n_train_batches} | "
             f"reward={metrics['reward/mean']:.3f} | "
             f"loss/datum={metrics['train/loss_per_datum']:.2f} | "
             f"datums={len(training_datums)} | "
             f"time={metrics['time/total']:.1f}s"
         )
+        if config.kl_penalty_coef > 0:
+            kl_val = kl_metrics.get("kl_policy_base", 0)
+            log_msg += f" | kl={kl_val:.4f}"
+        logger.info(log_msg)
 
     # Final evaluation
     sampling_client = training_client.save_weights_and_get_sampling_client()
