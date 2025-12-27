@@ -11,7 +11,7 @@ import tinker
 import torch
 from dotenv import load_dotenv
 from tinker_cookbook.renderers import get_renderer
-from tinker_cookbook import model_info
+from tinker_cookbook import model_info, checkpoint_utils
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import ml_log
 from tinker import types
@@ -151,6 +151,9 @@ class Config:
     clip_higher: bool = False  # Use DAPO-style asymmetric clipping (higher clip_high)
     # TODO: dynamic sampling options, kl penalty as in allen_ai run script
     # TODO: some other algorithms
+    # Checkpointing and resume
+    resume: bool = False  # Resume training from last checkpoint
+    save_every: int = 20  # Save checkpoint every N batches (0 = disabled)
     # Logging
     wandb_project: str = "tinkering2"
     # TODO: offline online async setups
@@ -192,6 +195,34 @@ def _setup_logging(config: Config):
     )
 
 
+async def _get_new_or_resume(
+    config: Config, service_client: tinker.ServiceClient, log_path: str
+) -> tuple[tinker.TrainingClient, int]:
+    """Create a new training client or resume from the last checkpoint.
+    
+    Returns:
+        tuple of (training_client, start_batch)
+    """
+    if config.resume:
+        resume_info = checkpoint_utils.get_last_checkpoint(log_path)
+        if resume_info:
+            training_client = await (
+                service_client.create_training_client_from_state_with_optimizer_async(
+                    resume_info["state_path"]
+                )
+            )
+            start_batch = resume_info["batch"]
+            logger.info(f"Resuming from batch {start_batch} (checkpoint: {resume_info['state_path']})")
+            return training_client, start_batch
+        else:
+            logger.warning("Resume requested but no checkpoint found. Starting from scratch.")
+
+    training_client = await service_client.create_lora_training_client_async(
+        base_model=config.model, rank=config.lora_rank, seed=config.seed
+    )
+    return training_client, 0
+
+
 # def compute_cosine_lr_with_warmup(
 #     step: int, total_steps: int, warmup_ratio: float = 0.1
 # ) -> float:
@@ -215,6 +246,8 @@ def _run_eval(
     ml_logger,
 ) -> tuple[float, dict[str, float]]:
     """Run evaluation on the test dataset and log metrics."""
+    start_time = time.time()
+    
     eval_sampling_params = tinker.SamplingParams(
         max_tokens=config.max_tokens,
         temperature=0.0,  # Greedy for eval
@@ -259,12 +292,15 @@ def _run_eval(
         "eval/instruction_loose_acc": instruction_loose_sum / n_samples,
     }
 
+    elapsed = time.time() - start_time
+    
     ml_logger.log_metrics(metrics, step=step)
     logger.info(
         f"Eval step {step} | "
         f"prompt_strict={metrics['eval/prompt_strict_acc']:.3f} | "
         f"prompt_loose={metrics['eval/prompt_loose_acc']:.3f} | "
-        f"instr_strict={metrics['eval/instruction_strict_acc']:.3f}"
+        f"instr_strict={metrics['eval/instruction_strict_acc']:.3f} | "
+        f"time={elapsed:.1f}s"
     )
 
     return metrics["eval/prompt_strict_acc"], metrics
@@ -294,10 +330,11 @@ async def main(config: Config):
     tokenizer = get_tokenizer(config.model)
     renderer = get_renderer(renderer_name, tokenizer)
 
+    run_name = _get_run_name(config)
+    log_path = f"./logs/{run_name}"
+
     service_client = tinker.ServiceClient()
-    training_client = await service_client.create_lora_training_client_async(
-        base_model=config.model, rank=config.lora_rank, seed=config.seed
-    )
+    training_client, start_batch = await _get_new_or_resume(config, service_client, log_path)
 
     adam_params = types.AdamParams(learning_rate=config.learning_rate)
     sampling_params = tinker.SamplingParams(
@@ -307,7 +344,7 @@ async def main(config: Config):
     )
 
     n_train_batches = len(train_data) // config.batch_size
-    logger.info(f"Training for {n_train_batches} batches")
+    logger.info(f"Training for {n_train_batches} batches (starting from batch {start_batch})")
     logger.info(f"Using renderer: {renderer_name}")
 
     # Early stopping state
@@ -316,6 +353,10 @@ async def main(config: Config):
 
     final_step = 0
     for batch_idx, start_idx in enumerate(range(0, len(train_data), config.batch_size)):
+        # Skip batches we've already completed when resuming
+        if batch_idx < start_batch:
+            continue
+
         final_step = batch_idx
         t_start = time.time()
         metrics: dict[str, float] = {
@@ -323,6 +364,17 @@ async def main(config: Config):
             "optim/lr": config.learning_rate,
             "progress/done_frac": (batch_idx + 1) / n_train_batches,
         }
+
+        # Save checkpoint periodically
+        if config.save_every > 0 and batch_idx > 0 and batch_idx % config.save_every == 0:
+            checkpoint_utils.save_checkpoint(
+                training_client=training_client,
+                name=f"{batch_idx:06d}",
+                log_path=log_path,
+                kind="state",
+                loop_state={"batch": batch_idx},
+            )
+            logger.info(f"Saved checkpoint at batch {batch_idx}")
 
         batch = train_data[
             start_idx : min(len(train_data), start_idx + config.batch_size)
@@ -477,8 +529,7 @@ async def main(config: Config):
                 )
         
         # Save rollouts for debugging (save every N steps to avoid too many files)
-        run_name = _get_run_name(config)
-        log_dir = Path(f"./logs/{run_name}")
+        log_dir = Path(log_path)
         if batch_idx % 5 == 0:  # Save every 5 batches (adjust as needed)
             save_rollouts_to_file(log_dir, batch_idx, batch_rollouts, max_samples=4)
 
@@ -545,9 +596,14 @@ async def main(config: Config):
     )
 
     # Save final checkpoint
-    run_name = _get_run_name(config)
-    save_result = training_client.save_state(run_name).result()
-    logger.info(f"Saved checkpoint: {save_result.path}")
+    checkpoint_utils.save_checkpoint(
+        training_client=training_client,
+        name="final",
+        log_path=log_path,
+        kind="both",
+        loop_state={"batch": final_step + 1},
+    )
+    logger.info(f"Saved final checkpoint to {log_path}")
 
     ml_logger.close()
     logger.info("Training completed")
