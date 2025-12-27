@@ -59,6 +59,7 @@ class Config:
     lora_rank: int = 32
     max_tokens: int = 2048
     eval_every: int = 10  # Evaluate every N batches
+    early_stopping_patience: int = 3  # Stop if no improvement for N consecutive evals
     # Logging
     wandb_project: str = "tinkering2"
 
@@ -210,6 +211,10 @@ async def main(config: Config):
     logger.info(f"Training for {n_train_batches} batches")
     logger.info(f"Using renderer: {renderer_name}")
 
+    # Early stopping state
+    best_eval_acc = -1.0
+    evals_without_improvement = 0
+
     for batch_idx, start_idx in enumerate(range(0, len(train_data), config.batch_size)):
         t_start = time.time()
         metrics: dict[str, float] = {
@@ -226,7 +231,7 @@ async def main(config: Config):
 
         # Run evaluation periodically
         if batch_idx % config.eval_every == 0:
-            _run_eval(
+            eval_acc, _ = _run_eval(
                 config,
                 renderer,
                 test_data,
@@ -234,6 +239,25 @@ async def main(config: Config):
                 batch_idx,
                 ml_logger,
             )
+
+            # Early stopping check
+            if eval_acc > best_eval_acc:
+                best_eval_acc = eval_acc
+                evals_without_improvement = 0
+                logger.info(f"New best eval accuracy: {best_eval_acc:.3f}")
+            else:
+                evals_without_improvement += 1
+                logger.info(
+                    f"No improvement for {evals_without_improvement} eval(s) "
+                    f"(best: {best_eval_acc:.3f}, current: {eval_acc:.3f})"
+                )
+
+            if evals_without_improvement >= config.early_stopping_patience:
+                logger.info(
+                    f"Early stopping triggered after {evals_without_improvement} "
+                    f"evaluations without improvement. Best accuracy: {best_eval_acc:.3f}"
+                )
+                break
 
         all_samples: list[asyncio.Future[types.SampleResponse]] = []
         all_prompts: list[list[int]] = []
@@ -329,12 +353,15 @@ async def main(config: Config):
         # Forward backward result has a metrics dict, not a loss attribute
         metrics.update({f"train/{k}": v for k, v in fwd_bwd_result.metrics.items()})
         metrics["train/num_datums"] = len(training_datums)
+        # Add normalized loss (per-datum average) for easier interpretation
+        loss_sum = fwd_bwd_result.metrics.get("loss:sum", 0.0)
+        metrics["train/loss_per_datum"] = loss_sum / len(training_datums) if training_datums else 0.0
         ml_logger.log_metrics(metrics, step=batch_idx)
-        train_loss = fwd_bwd_result.metrics.get("loss", 0.0)
         logger.info(
             f"Batch {batch_idx}/{n_train_batches} | "
             f"reward={metrics['reward/mean']:.3f} | "
-            f"loss={train_loss:.4f} | "
+            f"loss/datum={metrics['train/loss_per_datum']:.2f} | "
+            f"datums={len(training_datums)} | "
             f"time={metrics['time/total']:.1f}s"
         )
 
