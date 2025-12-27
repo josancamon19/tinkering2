@@ -422,6 +422,8 @@ class NGramOverlapChecker(Instruction):
 		n = 3
 		ngrams = set(nltk.ngrams(value, n))
 		ref_ngrams = set(nltk.ngrams(self._reference_text, n))
+		if not ngrams:
+			return False
 		overlap = len(ngrams.intersection(ref_ngrams)) / len(ngrams)
 		return self._percentage - 2 <= overlap * 100 <= self._percentage + 2
 
@@ -1168,8 +1170,12 @@ class LastWordFirstNextChecker(Instruction):
 		"""Checks if the last word of each sentence in the response is the first word of the next sentence."""
 		sentences = instructions_util.split_into_sentences(value)
 		for i in range(len(sentences) - 1):
-			last_word = sentences[i].rstrip(''.join(string.punctuation) + ' ').split()[-1]
-			first_word = sentences[i + 1].lstrip(''.join(string.punctuation) + ' ').split()[0]
+			current_words = sentences[i].rstrip(''.join(string.punctuation) + ' ').split()
+			next_words = sentences[i + 1].lstrip(''.join(string.punctuation) + ' ').split()
+			if not current_words or not next_words:
+				return False
+			last_word = current_words[-1]
+			first_word = next_words[0]
 			if last_word.lower() != first_word.lower():
 				return False
 		return True

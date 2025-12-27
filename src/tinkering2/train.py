@@ -60,6 +60,9 @@ class Config:
     max_tokens: int = 2048
     eval_every: int = 10  # Evaluate every N batches
     early_stopping_patience: int = 3  # Stop if no improvement for N consecutive evals
+    # Clipping options (PPO-style)
+    use_clipping: bool = False  # Use PPO instead of importance_sampling
+    clip_higher: bool = False  # Use DAPO-style asymmetric clipping (higher clip_high)
     # Logging
     wandb_project: str = "tinkering2"
 
@@ -75,10 +78,15 @@ class Row:
 def _get_run_name(config: Config) -> str:
     """Generate a descriptive run name based on config parameters."""
     model_short = config.model.split("/")[-1]
-    return (
+    name = (
         f"{model_short}_bs{config.batch_size}_lr{config.learning_rate:.0e}"
         f"_r{config.rollouts}_lora{config.lora_rank}"
     )
+    if config.use_clipping:
+        name += "_clip"
+        if config.clip_higher:
+            name += "-higher"
+    return name
 
 
 def _setup_logging(config: Config):
@@ -337,10 +345,23 @@ async def main(config: Config):
             )
             continue
 
-        fwd_bwd_future = training_client.forward_backward(
-            training_datums,
-            "importance_sampling",
-        )
+        # Choose loss function based on clipping config
+        if config.use_clipping:
+            loss_fn = "ppo"
+            loss_fn_config = {
+                "clip_low_threshold": 0.8,
+                "clip_high_threshold": 1.28 if config.clip_higher else 1.2,
+            }
+            fwd_bwd_future = training_client.forward_backward(
+                training_datums,
+                loss_fn,
+                loss_fn_config=loss_fn_config,
+            )
+        else:
+            fwd_bwd_future = training_client.forward_backward(
+                training_datums,
+                "importance_sampling",
+            )
         optim_step_future = training_client.optim_step(adam_params)
         fwd_bwd_result = fwd_bwd_future.result()
         _optim_result = optim_step_future.result()
