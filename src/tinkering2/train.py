@@ -355,7 +355,9 @@ async def main(config: Config):
         metrics["train/num_datums"] = len(training_datums)
         # Add normalized loss (per-datum average) for easier interpretation
         loss_sum = fwd_bwd_result.metrics.get("loss:sum", 0.0)
-        metrics["train/loss_per_datum"] = loss_sum / len(training_datums) if training_datums else 0.0
+        metrics["train/loss_per_datum"] = (
+            loss_sum / len(training_datums) if training_datums else 0.0
+        )
         ml_logger.log_metrics(metrics, step=batch_idx)
         logger.info(
             f"Batch {batch_idx}/{n_train_batches} | "

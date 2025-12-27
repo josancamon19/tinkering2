@@ -3682,6 +3682,7 @@ requires-dist = [
     { name = "flake8", marker = "extra == 'dev'" },
     { name = "inspect-evals", specifier = ">=0.3.103" },
     { name = "isort", marker = "extra == 'dev'" },
+    { name = "optuna", specifier = ">=3.6.0" },
     { name = "optuna", specifier = ">=4.6.0" },
     { name = "pip", specifier = ">=25.3" },
     { name = "pytest", marker = "extra == 'dev'" },
