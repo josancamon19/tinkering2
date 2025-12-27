@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
@@ -22,6 +22,90 @@ import enum
 _HERE = Path(__file__).parent
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RolloutInfo:
+    """Stores information about a single rollout for debugging."""
+    rollout_idx: int
+    response: str
+    reward: float
+    advantage: float
+    scores: dict
+    instruction_results: list  # List of (instruction_id, strict_pass, loose_pass)
+
+
+@dataclass
+class SampleRollouts:
+    """Stores all rollouts for a single input sample."""
+    sample_idx: int
+    prompt: str
+    instruction_id_list: list[str]
+    mean_reward: float
+    rollouts: list[RolloutInfo] = field(default_factory=list)
+
+
+def save_rollouts_to_file(
+    log_dir: Path,
+    batch_idx: int,
+    sample_rollouts_list: list[SampleRollouts],
+    max_samples: int = 4,  # Only save first N samples per batch to avoid huge files
+) -> None:
+    """Save rollout information to a text file for debugging.
+    
+    Creates files like: logs/run_name/rollouts/step_000.txt
+    """
+    rollouts_dir = log_dir / "rollouts"
+    rollouts_dir.mkdir(exist_ok=True)
+    
+    filepath = rollouts_dir / f"step_{batch_idx:04d}.txt"
+    
+    with open(filepath, "w") as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"BATCH/STEP: {batch_idx}\n")
+        f.write(f"Total samples in batch: {len(sample_rollouts_list)}\n")
+        f.write(f"Showing first {min(max_samples, len(sample_rollouts_list))} samples\n")
+        f.write("=" * 80 + "\n\n")
+        
+        for sample in sample_rollouts_list[:max_samples]:
+            f.write("─" * 80 + "\n")
+            f.write(f"SAMPLE {sample.sample_idx}\n")
+            f.write("─" * 80 + "\n\n")
+            
+            f.write("PROMPT:\n")
+            f.write(f"{sample.prompt}\n\n")
+            
+            f.write(f"INSTRUCTIONS: {sample.instruction_id_list}\n")
+            f.write(f"MEAN REWARD: {sample.mean_reward:.4f}\n\n")
+            
+            for rollout in sample.rollouts:
+                f.write("  " + "─" * 70 + "\n")
+                f.write(f"  ROLLOUT {rollout.rollout_idx}\n")
+                f.write("  " + "─" * 70 + "\n")
+                f.write(f"  Reward:    {rollout.reward:.4f}\n")
+                f.write(f"  Advantage: {rollout.advantage:+.4f}\n")
+                f.write("  Scores:\n")
+                for key, val in rollout.scores.items():
+                    f.write(f"    {key}: {val}\n")
+                f.write("  Instruction Results:\n")
+                for instr_id, strict, loose in rollout.instruction_results:
+                    f.write(f"    {instr_id}: strict={'PASS' if strict else 'FAIL'}, loose={'PASS' if loose else 'FAIL'}\n")
+                f.write("\n  RESPONSE:\n")
+                # Indent the response for readability
+                response_lines = rollout.response.split("\n")
+                # Truncate very long responses
+                if len(response_lines) > 50:
+                    response_lines = response_lines[:50] + ["... [TRUNCATED - response too long] ..."]
+                for line in response_lines:
+                    # Also truncate very long lines
+                    if len(line) > 200:
+                        line = line[:200] + "... [LINE TRUNCATED]"
+                    f.write(f"  | {line}\n")
+                f.write("\n")
+            
+            f.write("\n")
+    
+    logger.info(f"Saved rollouts to {filepath}")
 
 load_dotenv()
 
@@ -49,12 +133,12 @@ def get_reward_from_scores(scores: dict, reward_type: RewardType) -> float:
 
 @chz.chz
 class Config:
-    model: str = "meta-llama/Llama-3.2-3B"
+    model: str = "Qwen/Qwen3-4B-Instruct-2507"
     batch_size: int = 32
-    learning_rate: float = 1e-6
+    learning_rate: float = 1e-5
     seed: int = 42
     epochs: int = 10
-    rollouts: int = 3
+    rollouts: int = 16
     reward_type: RewardType = RewardType.FULL_STRICT
     lora_rank: int = 32
     max_tokens: int = 2048
@@ -230,7 +314,9 @@ async def main(config: Config):
     best_eval_acc = -1.0
     evals_without_improvement = 0
 
+    final_step = 0
     for batch_idx, start_idx in enumerate(range(0, len(train_data), config.batch_size)):
+        final_step = batch_idx
         t_start = time.time()
         metrics: dict[str, float] = {
             "progress/batch": batch_idx,
@@ -277,6 +363,9 @@ async def main(config: Config):
         all_samples: list[asyncio.Future[types.SampleResponse]] = []
         all_prompts: list[list[int]] = []
         batch_rewards: list[float] = []
+        
+        # For rollout logging
+        batch_rollouts: list[SampleRollouts] = []
 
         for item in batch:
             messages = [{"role": "user", "content": item.prompt}]
@@ -288,10 +377,13 @@ async def main(config: Config):
             all_prompts.append(model_input.to_ints())
 
         training_datums: list[types.Datum] = []
-        for samples, prompt_tokens, inputs in zip(all_samples, all_prompts, batch):
+        for sample_idx, (samples, prompt_tokens, inputs) in enumerate(zip(all_samples, all_prompts, batch)):
             grouped_tokens: list[list[int]] = []
             grouped_logprobs: list[list[float]] = []
             grouped_rewards: list[float] = []
+            grouped_responses: list[str] = []  # Store responses for logging
+            grouped_scores: list[dict] = []  # Store full scores for logging
+            grouped_instruction_results: list[list] = []  # Store instruction results for logging
             ob_len = len(prompt_tokens) - 1
 
             for sequence in (samples.result()).sequences:
@@ -301,7 +393,7 @@ async def main(config: Config):
                 parsed_response, _ = renderer.parse_response(seq_tokens)
                 content = parsed_response["content"]
                 content = strip_thinking(content).replace("<|im_end|>", "").strip()
-                _, scores = evaluate_output(
+                instruction_results, scores = evaluate_output(
                     content, inputs.instruction_id_list, inputs.kwargs, inputs.prompt
                 )
                 score: float = get_reward_from_scores(scores, config.reward_type)
@@ -309,6 +401,11 @@ async def main(config: Config):
                 grouped_tokens.append(prompt_tokens + seq_tokens)
                 grouped_logprobs.append(seq_logprobs)
                 grouped_rewards.append(score)
+                grouped_responses.append(content)
+                grouped_scores.append(scores)
+                grouped_instruction_results.append(
+                    [(r.instruction_id, r.strict_pass, r.loose_pass) for r in instruction_results]
+                )
 
             mean_reward = sum(grouped_rewards) / len(grouped_rewards)
             batch_rewards.append(mean_reward)
@@ -322,6 +419,32 @@ async def main(config: Config):
                 grouped_advantages = [(r - mean_reward) / (std_reward + 1e-8) for r in grouped_rewards]
             else:
                 grouped_advantages = [reward - mean_reward for reward in grouped_rewards]
+
+            # Collect rollout info for logging (before filtering zero advantages)
+            sample_rollouts = SampleRollouts(
+                sample_idx=sample_idx,
+                prompt=inputs.prompt,
+                instruction_id_list=inputs.instruction_id_list,
+                mean_reward=mean_reward,
+                rollouts=[
+                    RolloutInfo(
+                        rollout_idx=i,
+                        response=resp,
+                        reward=rew,
+                        advantage=adv,
+                        scores=sc,
+                        instruction_results=ir,
+                    )
+                    for i, (resp, rew, adv, sc, ir) in enumerate(zip(
+                        grouped_responses,
+                        grouped_rewards,
+                        grouped_advantages,
+                        grouped_scores,
+                        grouped_instruction_results,
+                    ))
+                ],
+            )
+            batch_rollouts.append(sample_rollouts)
 
             if all(adv == 0.0 for adv in grouped_advantages):
                 continue
@@ -352,6 +475,12 @@ async def main(config: Config):
                         },
                     )
                 )
+        
+        # Save rollouts for debugging (save every N steps to avoid too many files)
+        run_name = _get_run_name(config)
+        log_dir = Path(f"./logs/{run_name}")
+        if batch_idx % 5 == 0:  # Save every 5 batches (adjust as needed)
+            save_rollouts_to_file(log_dir, batch_idx, batch_rollouts, max_samples=4)
 
         # Skip batch if no training signal (all advantages were 0)
         if not training_datums:
@@ -411,7 +540,7 @@ async def main(config: Config):
         renderer,
         test_data,
         sampling_client,
-        n_train_batches,
+        final_step + 1,  # Use actual stopping point, not total batches
         ml_logger,
     )
 
