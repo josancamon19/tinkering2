@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import json
 import logging
+from pathlib import Path
 import time
 from typing import Any
 import chz
@@ -18,6 +19,8 @@ from tinker.types.tensor_data import TensorData
 from tinkering2.dataset.ifbench.simple_eval import evaluate_output, strip_thinking
 import enum
 
+_HERE = Path(__file__).parent
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -28,6 +31,20 @@ class RewardType(enum.Enum):
     FULL_LOOSE = "full_loose"
     PARTIAL_STRICT = "partial_strict"
     PARTIAL_LOOSE = "partial_loose"
+
+
+def get_reward_from_scores(scores: dict, reward_type: RewardType) -> float:
+    """Get the appropriate reward value based on reward_type configuration."""
+    if reward_type == RewardType.FULL_STRICT:
+        return float(scores["prompt_strict"])
+    elif reward_type == RewardType.FULL_LOOSE:
+        return float(scores["prompt_loose"])
+    elif reward_type == RewardType.PARTIAL_STRICT:
+        return float(scores["instruction_strict"])
+    elif reward_type == RewardType.PARTIAL_LOOSE:
+        return float(scores["instruction_loose"])
+    else:
+        raise ValueError(f"Unknown reward_type: {reward_type}")
 
 
 @chz.chz
@@ -94,7 +111,6 @@ def _run_eval(
     renderer,
     test_data: list[Row],
     sampling_client: tinker.SamplingClient,
-    sampling_params: tinker.SamplingParams,
     step: int,
     ml_logger,
 ) -> tuple[float, dict[str, float]]:
@@ -102,6 +118,7 @@ def _run_eval(
     eval_sampling_params = tinker.SamplingParams(
         max_tokens=config.max_tokens,
         temperature=0.0,  # Greedy for eval
+        stop=renderer.get_stop_sequences(),
     )
 
     all_samples: list[asyncio.Future[types.SampleResponse]] = []
@@ -157,7 +174,8 @@ async def main(config: Config):
     # Setup logging
     ml_logger = _setup_logging(config)
 
-    with open("src/tinkering2/dataset/ifbench/data.jsonl") as f:
+    data_path = _HERE / "dataset" / "ifbench" / "data.jsonl"
+    with open(data_path) as f:
         data = [json.loads(line) for line in f.readlines()]
 
     random.seed(config.seed)
@@ -177,7 +195,7 @@ async def main(config: Config):
     renderer = get_renderer(renderer_name, tokenizer)
 
     service_client = tinker.ServiceClient()
-    training_client = service_client.create_lora_training_client(
+    training_client = await service_client.create_lora_training_client_async(
         base_model=config.model, rank=config.lora_rank, seed=config.seed
     )
 
@@ -185,6 +203,7 @@ async def main(config: Config):
     sampling_params = tinker.SamplingParams(
         max_tokens=config.max_tokens,
         temperature=1.0,
+        stop=renderer.get_stop_sequences(),
     )
 
     n_train_batches = len(train_data) // config.batch_size
@@ -212,7 +231,6 @@ async def main(config: Config):
                 renderer,
                 test_data,
                 sampling_client,
-                sampling_params,
                 batch_idx,
                 ml_logger,
             )
@@ -247,7 +265,7 @@ async def main(config: Config):
                 _, scores = evaluate_output(
                     content, inputs.instruction_id_list, inputs.kwargs, inputs.prompt
                 )
-                score: float = scores["prompt_strict"]
+                score: float = get_reward_from_scores(scores, config.reward_type)
 
                 grouped_tokens.append(prompt_tokens + seq_tokens)
                 grouped_logprobs.append(seq_logprobs)
@@ -287,7 +305,15 @@ async def main(config: Config):
                     )
                 )
 
-        fwd_bwd_future = training_client.forward_backward_async(
+        # Skip batch if no training signal (all advantages were 0)
+        if not training_datums:
+            logger.warning(
+                f"Batch {batch_idx}: No training signal (all advantages were 0). "
+                "Consider increasing rollouts for more variance."
+            )
+            continue
+
+        fwd_bwd_future = training_client.forward_backward(
             training_datums,
             "importance_sampling",
         )
@@ -300,13 +326,15 @@ async def main(config: Config):
         metrics["reward/mean"] = (
             sum(batch_rewards) / len(batch_rewards) if batch_rewards else 0.0
         )
-        metrics["loss"] = fwd_bwd_result.loss
+        # Forward backward result has a metrics dict, not a loss attribute
+        metrics.update({f"train/{k}": v for k, v in fwd_bwd_result.metrics.items()})
         metrics["train/num_datums"] = len(training_datums)
         ml_logger.log_metrics(metrics, step=batch_idx)
+        train_loss = fwd_bwd_result.metrics.get("loss", 0.0)
         logger.info(
             f"Batch {batch_idx}/{n_train_batches} | "
             f"reward={metrics['reward/mean']:.3f} | "
-            f"loss={metrics['loss']:.4f} | "
+            f"loss={train_loss:.4f} | "
             f"time={metrics['time/total']:.1f}s"
         )
 
@@ -317,7 +345,6 @@ async def main(config: Config):
         renderer,
         test_data,
         sampling_client,
-        sampling_params,
         n_train_batches,
         ml_logger,
     )

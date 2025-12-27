@@ -114,7 +114,7 @@ def evaluate_output(
             strict_pass=strict_pass,
             loose_pass=loose_pass,
         ))
-        print(f"Instruction {instruction_id}: strict={'PASS' if strict_pass else 'FAIL'}, loose={'PASS' if loose_pass else 'FAIL'}")
+        # print(f"Instruction {instruction_id}: strict={'PASS' if strict_pass else 'FAIL'}, loose={'PASS' if loose_pass else 'FAIL'}")
 
     # Calculate scores
     num_instructions = len(results)

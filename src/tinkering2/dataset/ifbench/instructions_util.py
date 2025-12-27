@@ -1549,11 +1549,18 @@ WORD_LIST = [
 ]  # pylint: disable=line-too-long
 
 def download_nltk_resources():
-    """Download 'punkt' if not already installed"""
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt")
+    """Download all required NLTK resources quietly at startup."""
+    resources = [
+        ("tokenizers/punkt", "punkt"),
+        ("tokenizers/punkt_tab", "punkt_tab"),
+        ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+        ("corpora/stopwords", "stopwords"),
+    ]
+    for path, name in resources:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            nltk.download(name, quiet=True)
 
 
 download_nltk_resources()
@@ -1635,7 +1642,7 @@ def _get_sentence_tokenizer():
 
 def count_stopwords(text):
     """Counts the number of stopwords."""
-    nltk.download('stopwords')
+    # NLTK resources downloaded at startup
     stopwords = nltk.corpus.stopwords.words('english')
     tokenizer = nltk.tokenize.RegexpTokenizer(r"\w+")
     tokens = tokenizer.tokenize(text)
