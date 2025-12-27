@@ -23,7 +23,11 @@ class Config:
     # model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
     # model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     # model_name: str = "Qwen/Qwen3-32B"
-    model_name: str = "Qwen/Qwen3-8B"
+    model_name: str = "meta-llama/Llama-3.2-3B"
+    # Tinker checkpoint path (e.g., "tinker://run-id/weights/checkpoint-001")
+    # If provided, this takes precedence over model_name for sampling.
+    # The base model will be automatically inferred from the checkpoint.
+    checkpoint_path: str | None = None
     sample_idx: int = 0
     run_all: bool = False
 
@@ -148,9 +152,23 @@ def strip_thinking(content: str) -> str:
 
 async def run_ifbench(config: Config):
     client = tinker.ServiceClient()
-    sampling_client = client.create_sampling_client(base_model=config.model_name)
-    renderer_name = model_info.get_recommended_renderer_name(config.model_name)
-    tokenizer = get_tokenizer(config.model_name)
+    
+    # Determine base model and create sampling client
+    if config.checkpoint_path:
+        # Using a Tinker checkpoint - get base model info from the checkpoint
+        rest_client = client.create_rest_client()
+        weights_info = rest_client.get_weights_info_by_tinker_path(config.checkpoint_path).result()
+        base_model = weights_info.base_model
+        sampling_client = client.create_sampling_client(model_path=config.checkpoint_path)
+        print(f"Using Tinker checkpoint: {config.checkpoint_path}")
+        print(f"Base model: {base_model}")
+    else:
+        # Using a base model directly
+        base_model = config.model_name
+        sampling_client = client.create_sampling_client(base_model=base_model)
+    
+    renderer_name = model_info.get_recommended_renderer_name(base_model)
+    tokenizer = get_tokenizer(base_model)
     renderer = get_renderer(renderer_name, tokenizer)
 
     sampling_params = tinker.SamplingParams(
@@ -196,7 +214,13 @@ async def run_ifbench(config: Config):
 
         results_dir = Path("./results")
         results_dir.mkdir(exist_ok=True)
-        model_filename = config.model_name.split("/")[-1] + ".jsonl"
+        # Generate filename from checkpoint path or model name
+        if config.checkpoint_path:
+            # Extract a meaningful name from checkpoint path (e.g., "tinker://run-id/weights/checkpoint-001")
+            checkpoint_name = config.checkpoint_path.replace("tinker://", "").replace("/", "_")
+            model_filename = f"checkpoint_{checkpoint_name}.jsonl"
+        else:
+            model_filename = config.model_name.split("/")[-1] + ".jsonl"
 
         with open(results_dir / model_filename, "w") as f:
             for result in all_results:
@@ -210,7 +234,8 @@ async def run_ifbench(config: Config):
         instruction_loose = sum(r["scores"]["instruction_loose"] for r in all_results) / n
         
         print("\n" + "=" * 60)
-        print(f"Results for {config.model_name}")
+        model_display = config.checkpoint_path if config.checkpoint_path else config.model_name
+        print(f"Results for {model_display}")
         print("=" * 60)
         print(f"Prompt-level strict accuracy:      {prompt_strict:.1%} ({prompt_strict * n:.0f}/{n})")
         print(f"Prompt-level LOOSE accuracy:       {prompt_loose:.1%} ({prompt_loose * n:.0f}/{n})")
