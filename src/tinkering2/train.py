@@ -60,11 +60,16 @@ class Config:
     max_tokens: int = 2048
     eval_every: int = 10  # Evaluate every N batches
     early_stopping_patience: int = 3  # Stop if no improvement for N consecutive evals
+    # Advantage normalization
+    advantage_std_norm: bool = False  # GRPO-style: divide advantage by std (Section 2.2)
     # Clipping options (PPO-style)
     use_clipping: bool = False  # Use PPO instead of importance_sampling
     clip_higher: bool = False  # Use DAPO-style asymmetric clipping (higher clip_high)
+    # TODO: dynamic sampling options, kl penalty as in allen_ai run script
+    # TODO: some other algorithms
     # Logging
     wandb_project: str = "tinkering2"
+    # TODO: offline online async setups
 
 
 @dataclass
@@ -82,6 +87,8 @@ def _get_run_name(config: Config) -> str:
         f"{model_short}_bs{config.batch_size}_lr{config.learning_rate:.0e}"
         f"_r{config.rollouts}_lora{config.lora_rank}"
     )
+    if config.advantage_std_norm:
+        name += "_stdnorm"
     if config.use_clipping:
         name += "_clip"
         if config.clip_higher:
@@ -305,7 +312,16 @@ async def main(config: Config):
 
             mean_reward = sum(grouped_rewards) / len(grouped_rewards)
             batch_rewards.append(mean_reward)
-            grouped_advantages = [reward - mean_reward for reward in grouped_rewards]
+            
+            # Compute advantages with optional std normalization (GRPO-style)
+            if config.advantage_std_norm:
+                # GRPO: A_i = (r_i - mean) / std
+                variance = sum((r - mean_reward) ** 2 for r in grouped_rewards) / len(grouped_rewards)
+                std_reward = variance ** 0.5
+                # Add small epsilon to avoid division by zero
+                grouped_advantages = [(r - mean_reward) / (std_reward + 1e-8) for r in grouped_rewards]
+            else:
+                grouped_advantages = [reward - mean_reward for reward in grouped_rewards]
 
             if all(adv == 0.0 for adv in grouped_advantages):
                 continue
