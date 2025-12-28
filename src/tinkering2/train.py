@@ -51,12 +51,15 @@ def get_reward_from_scores(scores: dict, reward_type: RewardType) -> float:
         raise ValueError(f"Unknown reward_type: {reward_type}")
 
 
+# it costs $17 per run
+
+
 @chz.chz
 class Config:
     model: str = "Qwen/Qwen3-4B-Instruct-2507"
     seed: int = 42
     eval_every: int = 5  # Evaluate every N batches
-    early_stopping_patience: int = 3  # Stop if no improvement for N consecutive evals
+    early_stopping_patience: int = 8  # Stop if no improvement for N consecutive evals
     resume: bool = False  # Resume training from last checkpoint
     save_every: int = 20  # Save checkpoint every N batches (0 = disabled)
     wandb_project: str = "tinkering2"
@@ -72,8 +75,14 @@ class Config:
     epochs: int = 20
 
     # RL hyperparameters
+    # this data is quite complex, so more rollouts avoid's lack of variance
     rollouts: int = 16
-    advantage_std_norm: bool = False  # adv norm, z-score /std default GRPO deepseek
+
+    # Advantage std normalization (GRPO z-score): A_i = (r_i - mean) / std
+    # Disabled for binary rewards (FULL_STRICT/LOOSE) - std norm distorts gradients when
+    # rewards are 0/1 (e.g., 15/16 correct → std≈0.25 → 4x amplified advantages).
+    # Enable for continuous rewards (PARTIAL_*) or to match original GRPO paper.
+    advantage_std_norm: bool = False
 
     # - clipping options
     use_clipping: bool = False  # default ppo clipping, 1-0.2, 1+0.2
@@ -367,6 +376,7 @@ async def main(config: Config):
         all_samples: list[asyncio.Future[types.SampleResponse]] = []
         all_prompts: list[list[int]] = []
         batch_rewards: list[float] = []
+        all_logprobs_flat: list[float] = []  # For entropy computation
 
         # For rollout logging
         batch_rollouts: list[SampleRollouts] = []
@@ -417,6 +427,10 @@ async def main(config: Config):
                         for r in instruction_results
                     ]
                 )
+
+                # Collect logprobs for entropy computation
+                if seq_logprobs:
+                    all_logprobs_flat.extend(seq_logprobs)
 
             mean_reward = sum(grouped_rewards) / len(grouped_rewards)
             batch_rewards.append(mean_reward)
@@ -557,6 +571,16 @@ async def main(config: Config):
             sum(batch_rewards) / len(batch_rewards) if batch_rewards else 0.0
         )
 
+        # Entropy metrics (using -mean(logprobs) as proxy)
+        # Lower values = more confident/collapsed, Higher values = more exploratory
+        if all_logprobs_flat:
+            mean_logprob = sum(all_logprobs_flat) / len(all_logprobs_flat)
+            metrics["entropy/mean_logprob"] = mean_logprob
+            metrics["entropy/proxy"] = -mean_logprob  # Higher = more entropy
+            # Also compute min/max logprobs to see the range
+            metrics["entropy/min_logprob"] = min(all_logprobs_flat)
+            metrics["entropy/max_logprob"] = max(all_logprobs_flat)
+
         # KL penalty metrics (from Tinker's incorporate_kl_penalty)
         if kl_metrics:
             metrics.update({f"kl/{k}": v for k, v in kl_metrics.items()})
@@ -580,6 +604,8 @@ async def main(config: Config):
             f"datums={len(training_datums)} | "
             f"time={metrics['time/total']:.1f}s"
         )
+        if "entropy/proxy" in metrics:
+            log_msg += f" | entropy={metrics['entropy/proxy']:.3f}"
         if config.kl_penalty_coef > 0:
             kl_val = kl_metrics.get("kl_policy_base", 0)
             log_msg += f" | kl={kl_val:.4f}"
