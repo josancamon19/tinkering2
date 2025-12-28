@@ -107,7 +107,15 @@ class Config:
     # Set to False if you want consistent batch sizes for optimizer/scheduler stability,
     # though this comes at the cost of wasted compute on zero-gradient samples.
     filter_zero_advantage: bool = True
-    # TODO: option to run dynamic sampling as well
+
+    # - Dynamic Sampling (DAPO-style)
+    # Instead of just filtering zero-advantage groups, keep sampling additional prompts
+    # from the training set until we have enough valid training datums. This ensures
+    # consistent effective batch sizes while avoiding wasted compute.
+    # When enabled, filter_zero_advantage is implicitly True.
+    dynamic_sampling: bool = False
+    # Maximum rounds of extra sampling to try before giving up
+    dynamic_sampling_max_retries: int = 3
 
     # - KL penalty options (uses Tinker's incorporate_kl_penalty)
     # Computes KL divergence against a frozen base model and adjusts advantages.
@@ -161,6 +169,8 @@ def _get_run_name(config: Config) -> str:
         name += f"_kl{config.kl_penalty_coef}"
     if config.training_mode == TrainingMode.ASYNC:
         name += f"_async{config.async_max_staleness}"
+    if config.dynamic_sampling:
+        name += "_dynsamp"
     return name
 
 
@@ -436,6 +446,123 @@ async def _generate_rollouts_for_batch(
     )
 
 
+@dataclass
+class DynamicSamplingResult:
+    """Result of dynamic sampling rollout generation."""
+
+    rollout_result: RolloutBatchResult
+    extra_prompts_sampled: int  # How many extra prompts we sampled beyond the batch
+    sampling_rounds: int  # How many rounds of sampling we did (1 = just the batch)
+
+
+async def _generate_rollouts_with_dynamic_sampling(
+    config: Config,
+    batch: list[Row],
+    all_train_data: list[Row],
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    sampling_params: tinker.SamplingParams,
+) -> DynamicSamplingResult:
+    """
+    Dynamic Sampling (DAPO-style): keep sampling until we have enough valid datums.
+
+    Instead of just filtering zero-advantage prompts, we continue sampling random
+    prompts from the training set until we reach the target number of valid training
+    datums (prompts with reward variance that provide gradient signal).
+
+    This ensures consistent effective batch sizes without wasted compute.
+    """
+    # Target: we want batch_size prompts worth of valid datums
+    # Each valid prompt contributes `rollouts` datums
+    target_valid_prompts = config.batch_size
+
+    # Track all results across sampling rounds
+    all_training_datums: list[types.Datum] = []
+    all_batch_rewards: list[float] = []
+    all_logprobs_flat: list[float] = []
+    all_batch_rollouts: list[SampleRollouts] = []
+
+    # Track which prompt keys we've already sampled (to avoid duplicates)
+    used_keys: set[int] = {row.key for row in batch}
+    valid_prompts_count = 0
+    extra_prompts_sampled = 0
+    sampling_rounds = 0
+
+    prompts_to_sample = list(batch)
+
+    for attempt in range(config.dynamic_sampling_max_retries + 1):
+        if not prompts_to_sample:
+            break
+
+        sampling_rounds += 1
+
+        # Generate rollouts for current set of prompts
+        result = await _generate_rollouts_for_batch(
+            config, prompts_to_sample, sampling_client, renderer, sampling_params
+        )
+
+        # Count valid prompts (those that contributed training datums)
+        # A prompt is valid if it has variance in rewards
+        prompts_with_datums = len(result.training_datums) // config.rollouts
+        valid_prompts_count += prompts_with_datums
+
+        # Accumulate results
+        all_training_datums.extend(result.training_datums)
+        all_batch_rewards.extend(result.batch_rewards)
+        all_logprobs_flat.extend(result.all_logprobs_flat)
+        all_batch_rollouts.extend(result.batch_rollouts)
+
+        # Check if we have enough
+        if valid_prompts_count >= target_valid_prompts:
+            # Trim to target if we overshot
+            target_datums = target_valid_prompts * config.rollouts
+            if len(all_training_datums) > target_datums:
+                all_training_datums = all_training_datums[:target_datums]
+            break
+
+        # Need more! Randomly sample from training data (excluding used prompts)
+        available = [row for row in all_train_data if row.key not in used_keys]
+        if not available:
+            logger.debug("Dynamic sampling: exhausted all available prompts")
+            break
+
+        # How many more valid prompts do we need?
+        needed = target_valid_prompts - valid_prompts_count
+        # Sample a bit more than needed since some might have zero variance
+        # Use 2x as a heuristic to reduce sampling rounds
+        sample_count = min(needed * 2, len(available))
+
+        extra = random.sample(available, sample_count)
+        extra_prompts_sampled += len(extra)
+
+        for row in extra:
+            used_keys.add(row.key)
+
+        prompts_to_sample = extra
+        logger.debug(
+            f"Dynamic sampling round {sampling_rounds}: "
+            f"valid={valid_prompts_count}/{target_valid_prompts}, "
+            f"sampling {len(extra)} more prompts"
+        )
+
+    if valid_prompts_count < target_valid_prompts:
+        logger.warning(
+            f"Dynamic sampling: only got {valid_prompts_count}/{target_valid_prompts} "
+            f"valid prompts after {sampling_rounds} rounds"
+        )
+
+    return DynamicSamplingResult(
+        rollout_result=RolloutBatchResult(
+            training_datums=all_training_datums,
+            batch_rewards=all_batch_rewards,
+            all_logprobs_flat=all_logprobs_flat,
+            batch_rollouts=all_batch_rollouts,
+        ),
+        extra_prompts_sampled=extra_prompts_sampled,
+        sampling_rounds=sampling_rounds,
+    )
+
+
 async def main(config: Config):
     # Setup logging
     ml_logger = _setup_logging(config)
@@ -506,6 +633,12 @@ async def main(config: Config):
     else:
         logger.info("Using ONLINE (synchronous) training mode")
 
+    if config.dynamic_sampling:
+        logger.info(
+            f"Dynamic sampling ENABLED: will sample extra prompts to maintain "
+            f"batch_size={config.batch_size} valid prompts (max {config.dynamic_sampling_max_retries} retries)"
+        )
+
     # For async mode: use a deque to track pending rollout tasks
     # Each entry is (batch_idx, staleness_when_used, task)
     # staleness_when_used = how many training steps behind the policy was when sampling started
@@ -522,11 +655,23 @@ async def main(config: Config):
             # but was sampled with θ_0. At iteration j, we'll have trained j times,
             # so staleness = j (for j=0, staleness=0; for j=1, staleness=1, etc.)
             staleness = j
-            task = asyncio.create_task(
-                _generate_rollouts_for_batch(
-                    config, prefetch_batch, sampling_client, renderer, sampling_params
+            if config.dynamic_sampling:
+                task = asyncio.create_task(
+                    _generate_rollouts_with_dynamic_sampling(
+                        config,
+                        prefetch_batch,
+                        train_data,
+                        sampling_client,
+                        renderer,
+                        sampling_params,
+                    )
                 )
-            )
+            else:
+                task = asyncio.create_task(
+                    _generate_rollouts_for_batch(
+                        config, prefetch_batch, sampling_client, renderer, sampling_params
+                    )
+                )
             pending_rollouts.append((prefetch_batch_idx, staleness, task))
         logger.info(f"Pre-fetched {n_prefetch} batches for async training")
 
@@ -596,6 +741,8 @@ async def main(config: Config):
 
         # === Get rollouts for current batch ===
         current_staleness = 0  # For logging
+        dynamic_sampling_metrics: dict[str, float] = {}
+
         if config.training_mode == TrainingMode.ASYNC:
             # ASYNC mode: pop the oldest pre-fetched rollouts from the deque
             assert len(pending_rollouts) > 0, (
@@ -607,7 +754,16 @@ async def main(config: Config):
             assert popped_batch_idx == batch_idx, (
                 f"Batch mismatch: expected {batch_idx}, got {popped_batch_idx}"
             )
-            rollout_result = await rollout_task
+
+            if config.dynamic_sampling:
+                dyn_result = await rollout_task
+                rollout_result = dyn_result.rollout_result
+                dynamic_sampling_metrics = {
+                    "extra_prompts": dyn_result.extra_prompts_sampled,
+                    "sampling_rounds": dyn_result.sampling_rounds,
+                }
+            else:
+                rollout_result = await rollout_task
 
             # Start generating a future batch's rollouts using current weights
             # We want to keep the deque at max_staleness size
@@ -618,22 +774,51 @@ async def main(config: Config):
                 # When we use this at iteration future_i, we'll have trained future_i times
                 # Staleness = future_i - i = max_staleness
                 future_staleness = config.async_max_staleness
-                task = asyncio.create_task(
-                    _generate_rollouts_for_batch(
-                        config,
-                        future_batch,
-                        eval_sampling_client,
-                        renderer,
-                        sampling_params,
+
+                if config.dynamic_sampling:
+                    task = asyncio.create_task(
+                        _generate_rollouts_with_dynamic_sampling(
+                            config,
+                            future_batch,
+                            train_data,
+                            eval_sampling_client,
+                            renderer,
+                            sampling_params,
+                        )
                     )
-                )
+                else:
+                    task = asyncio.create_task(
+                        _generate_rollouts_for_batch(
+                            config,
+                            future_batch,
+                            eval_sampling_client,
+                            renderer,
+                            sampling_params,
+                        )
+                    )
                 pending_rollouts.append((future_batch_idx, future_staleness, task))
         else:
             # ONLINE mode: generate rollouts synchronously with current policy
             sampling_client = training_client.save_weights_and_get_sampling_client()
-            rollout_result = await _generate_rollouts_for_batch(
-                config, batch, sampling_client, renderer, sampling_params
-            )
+
+            if config.dynamic_sampling:
+                dyn_result = await _generate_rollouts_with_dynamic_sampling(
+                    config,
+                    batch,
+                    train_data,
+                    sampling_client,
+                    renderer,
+                    sampling_params,
+                )
+                rollout_result = dyn_result.rollout_result
+                dynamic_sampling_metrics = {
+                    "extra_prompts": dyn_result.extra_prompts_sampled,
+                    "sampling_rounds": dyn_result.sampling_rounds,
+                }
+            else:
+                rollout_result = await _generate_rollouts_for_batch(
+                    config, batch, sampling_client, renderer, sampling_params
+                )
 
         training_datums = rollout_result.training_datums
         batch_rewards = rollout_result.batch_rewards
@@ -716,6 +901,15 @@ async def main(config: Config):
             metrics["async/max_staleness"] = config.async_max_staleness
             metrics["async/pending_tasks"] = len(pending_rollouts)
 
+        # Track dynamic sampling metrics
+        if config.dynamic_sampling and dynamic_sampling_metrics:
+            metrics["dynamic_sampling/extra_prompts"] = dynamic_sampling_metrics[
+                "extra_prompts"
+            ]
+            metrics["dynamic_sampling/sampling_rounds"] = dynamic_sampling_metrics[
+                "sampling_rounds"
+            ]
+
         ml_logger.log_metrics(metrics, step=batch_idx)
 
         # Build log message
@@ -736,6 +930,11 @@ async def main(config: Config):
         if config.kl_penalty_coef > 0:
             kl_val = kl_metrics.get("kl_policy_base", 0)
             log_msg += f" | kl={kl_val:.4f}"
+        if config.dynamic_sampling and dynamic_sampling_metrics:
+            extra = dynamic_sampling_metrics["extra_prompts"]
+            rounds = dynamic_sampling_metrics["sampling_rounds"]
+            if extra > 0:
+                log_msg += f" | dyn_samp=+{extra}prompts/{rounds}rnd"
         logger.info(log_msg)
 
     # Final evaluation
