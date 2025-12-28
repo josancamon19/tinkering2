@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass
 import json
 import logging
@@ -117,8 +118,13 @@ class Config:
     # Discount factor for future KL (0 = no discounting)
     kl_discount_factor: float = 0.0
 
-    # Training mode: online (sync) vs async (pipelined with 1-step delay)
+    # Training mode: online (sync) vs async (pipelined)
     training_mode: TrainingMode = TrainingMode.ONLINE
+    # Max policy staleness for async mode: how many steps ahead to prefetch rollouts.
+    # staleness=1: rollouts for batch N use weights θ_{N-1} (1 step behind)
+    # staleness=2: rollouts for batch N use weights θ_{N-2} (2 steps behind), etc.
+    # Higher values = more parallelism but more off-policy. PPO clipping helps mitigate.
+    async_max_staleness: int = 1
 
     # TODO: do we need pass @k as well?
     # TODO: check deeper seed values
@@ -148,7 +154,7 @@ def _get_run_name(config: Config) -> str:
     if config.kl_penalty_coef > 0:
         name += f"_kl{config.kl_penalty_coef}"
     if config.training_mode == TrainingMode.ASYNC:
-        name += "_async"
+        name += f"_async{config.async_max_staleness}"
     return name
 
 
@@ -488,24 +494,35 @@ async def main(config: Config):
         batch_items.append((batch_idx, batch))
 
     if config.training_mode == TrainingMode.ASYNC:
-        logger.info("Using ASYNC (pipelined) training mode with 1-step policy delay")
+        logger.info(
+            f"Using ASYNC (pipelined) training mode with max {config.async_max_staleness}-step policy delay"
+        )
     else:
         logger.info("Using ONLINE (synchronous) training mode")
 
-    # For async mode: pre-fetch first batch's rollouts
-    pending_rollout_task: asyncio.Task[RolloutBatchResult] | None = None
-    pending_batch_idx: int | None = None
+    # For async mode: use a deque to track pending rollout tasks
+    # Each entry is (batch_idx, staleness_when_used, task)
+    # staleness_when_used = how many training steps behind the policy was when sampling started
+    pending_rollouts: deque[tuple[int, int, asyncio.Task[RolloutBatchResult]]] = deque()
 
     if config.training_mode == TrainingMode.ASYNC and len(batch_items) > 0:
-        # Get initial sampling client and start first batch
+        # Pre-fetch up to max_staleness batches before training starts
+        # All these use the initial weights (θ_0), so staleness increases with each
         sampling_client = training_client.save_weights_and_get_sampling_client()
-        first_batch_idx, first_batch = batch_items[0]
-        pending_rollout_task = asyncio.create_task(
-            _generate_rollouts_for_batch(
-                config, first_batch, sampling_client, renderer, sampling_params
+        n_prefetch = min(config.async_max_staleness, len(batch_items))
+        for j in range(n_prefetch):
+            prefetch_batch_idx, prefetch_batch = batch_items[j]
+            # Staleness when used: batch j will be used at iteration j,
+            # but was sampled with θ_0. At iteration j, we'll have trained j times,
+            # so staleness = j (for j=0, staleness=0; for j=1, staleness=1, etc.)
+            staleness = j
+            task = asyncio.create_task(
+                _generate_rollouts_for_batch(
+                    config, prefetch_batch, sampling_client, renderer, sampling_params
+                )
             )
-        )
-        pending_batch_idx = first_batch_idx
+            pending_rollouts.append((prefetch_batch_idx, staleness, task))
+        logger.info(f"Pre-fetched {n_prefetch} batches for async training")
 
     final_step = 0
     early_stop = False
@@ -572,31 +589,35 @@ async def main(config: Config):
                 break
 
         # === Get rollouts for current batch ===
+        current_staleness = 0  # For logging
         if config.training_mode == TrainingMode.ASYNC:
-            # ASYNC mode: await the pre-fetched rollouts
-            assert pending_rollout_task is not None
-            assert pending_batch_idx == batch_idx
-            rollout_result = await pending_rollout_task
+            # ASYNC mode: pop the oldest pre-fetched rollouts from the deque
+            assert len(pending_rollouts) > 0, f"No pending rollouts for batch {batch_idx}"
+            popped_batch_idx, current_staleness, rollout_task = pending_rollouts.popleft()
+            assert popped_batch_idx == batch_idx, (
+                f"Batch mismatch: expected {batch_idx}, got {popped_batch_idx}"
+            )
+            rollout_result = await rollout_task
 
-            # Start generating NEXT batch's rollouts immediately (1-step stale policy)
-            # The sampling_client here uses weights from BEFORE training this batch
-            if i + 1 < len(batch_items):
-                next_batch_idx, next_batch = batch_items[i + 1]
-                # Use eval_sampling_client which has current weights
-                # (will be 1-step stale when we use these rollouts next iteration)
-                pending_rollout_task = asyncio.create_task(
+            # Start generating a future batch's rollouts using current weights
+            # We want to keep the deque at max_staleness size
+            future_i = i + config.async_max_staleness
+            if future_i < len(batch_items):
+                future_batch_idx, future_batch = batch_items[future_i]
+                # Current weights are θ_i (after training batches 0..i-1, about to train i)
+                # When we use this at iteration future_i, we'll have trained future_i times
+                # Staleness = future_i - i = max_staleness
+                future_staleness = config.async_max_staleness
+                task = asyncio.create_task(
                     _generate_rollouts_for_batch(
                         config,
-                        next_batch,
+                        future_batch,
                         eval_sampling_client,
                         renderer,
                         sampling_params,
                     )
                 )
-                pending_batch_idx = next_batch_idx
-            else:
-                pending_rollout_task = None
-                pending_batch_idx = None
+                pending_rollouts.append((future_batch_idx, future_staleness, task))
         else:
             # ONLINE mode: generate rollouts synchronously with current policy
             sampling_client = training_client.save_weights_and_get_sampling_client()
@@ -681,12 +702,18 @@ async def main(config: Config):
 
         # Track async-specific metrics
         if config.training_mode == TrainingMode.ASYNC:
-            metrics["async/policy_staleness"] = 1  # 1-step delay
+            metrics["async/policy_staleness"] = current_staleness
+            metrics["async/max_staleness"] = config.async_max_staleness
+            metrics["async/pending_tasks"] = len(pending_rollouts)
 
         ml_logger.log_metrics(metrics, step=batch_idx)
 
         # Build log message
-        mode_tag = "[async]" if config.training_mode == TrainingMode.ASYNC else ""
+        mode_tag = (
+            f"[async s={current_staleness}]"
+            if config.training_mode == TrainingMode.ASYNC
+            else ""
+        )
         log_msg = (
             f"Batch {batch_idx}/{n_train_batches} {mode_tag}| "
             f"reward={metrics['reward/mean']:.3f} | "
