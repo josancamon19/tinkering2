@@ -18,7 +18,7 @@ from tinker_cookbook.rl.metrics import incorporate_kl_penalty
 from tinker import types
 from tinker.types.tensor_data import TensorData
 from tinkering2.dataset.ifbench.simple_eval import evaluate_output, strip_thinking
-from tinkering2.config import Config, TrainingMode, get_reward_from_scores
+from tinkering2.config import Config, TrainingMode, Row
 from tinkering2.utils import (
     SampleRollouts,
     RolloutInfo,
@@ -26,19 +26,13 @@ from tinkering2.utils import (
     set_seed,
     setup_logging,
     get_run_name,
+    get_reward_from_scores,
 )
+from tinkering2.eval import run as run_eval
 
 _HERE = Path(__file__).parent
 logger = logging.getLogger(__name__)
 load_dotenv()
-
-
-@dataclass
-class Row:
-    key: int
-    prompt: str
-    instruction_id_list: list[str]
-    kwargs: list[dict[str, Any]]
 
 
 async def _get_new_or_resume(
@@ -71,75 +65,6 @@ async def _get_new_or_resume(
         base_model=config.model, rank=config.lora_rank, seed=config.seed
     )
     return training_client, 0
-
-
-def _run_eval(
-    config: Config,
-    renderer,
-    test_data: list[Row],
-    sampling_client: tinker.SamplingClient,
-    step: int,
-    ml_logger,
-) -> tuple[float, dict[str, float]]:
-    """Run evaluation on the test dataset and log metrics."""
-    start_time = time.time()
-
-    eval_sampling_params = tinker.SamplingParams(
-        max_tokens=config.max_tokens,
-        temperature=0.0,  # Greedy for eval
-        stop=renderer.get_stop_sequences(),
-    )
-
-    all_samples: list[asyncio.Future[types.SampleResponse]] = []
-    for item in test_data:
-        messages = [{"role": "user", "content": item.prompt}]
-        model_input = renderer.build_generation_prompt(messages)
-        sample_future = sampling_client.sample(model_input, 1, eval_sampling_params)
-        all_samples.append(sample_future)
-
-    # Collect results
-    prompt_strict_sum = 0.0
-    prompt_loose_sum = 0.0
-    instruction_strict_sum = 0.0
-    instruction_loose_sum = 0.0
-
-    for sample_future, item in zip(all_samples, test_data):
-        sample_result = sample_future.result()
-        seq_tokens = sample_result.sequences[0].tokens
-
-        parsed_response, _ = renderer.parse_response(seq_tokens)
-        content = parsed_response["content"]
-        content = strip_thinking(content).replace("<|im_end|>", "").strip()
-
-        _, scores = evaluate_output(
-            content, item.instruction_id_list, item.kwargs, item.prompt
-        )
-
-        prompt_strict_sum += scores["prompt_strict"]
-        prompt_loose_sum += scores["prompt_loose"]
-        instruction_strict_sum += scores["instruction_strict"]
-        instruction_loose_sum += scores["instruction_loose"]
-
-    n_samples = len(test_data)
-    metrics = {
-        "eval/prompt_strict_acc": prompt_strict_sum / n_samples,
-        "eval/prompt_loose_acc": prompt_loose_sum / n_samples,
-        "eval/instruction_strict_acc": instruction_strict_sum / n_samples,
-        "eval/instruction_loose_acc": instruction_loose_sum / n_samples,
-    }
-
-    elapsed = time.time() - start_time
-
-    ml_logger.log_metrics(metrics, step=step)
-    logger.info(
-        f"Eval step {step} | "
-        f"prompt_strict={metrics['eval/prompt_strict_acc']:.3f} | "
-        f"prompt_loose={metrics['eval/prompt_loose_acc']:.3f} | "
-        f"instr_strict={metrics['eval/instruction_strict_acc']:.3f} | "
-        f"time={elapsed:.1f}s"
-    )
-
-    return metrics["eval/prompt_strict_acc"], metrics
 
 
 @dataclass
@@ -569,7 +494,7 @@ async def main(config: Config):
 
         # Run evaluation periodically
         if batch_idx % config.eval_every == 0:
-            eval_acc, _ = _run_eval(
+            eval_acc, _ = run_eval(
                 config,
                 renderer,
                 test_data,
@@ -798,7 +723,7 @@ async def main(config: Config):
 
     # Final evaluation
     sampling_client = training_client.save_weights_and_get_sampling_client()
-    _run_eval(
+    run_eval(
         config,
         renderer,
         test_data,

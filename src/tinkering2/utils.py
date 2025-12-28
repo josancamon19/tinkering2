@@ -5,6 +5,9 @@ import random
 import numpy as np
 import torch
 
+from tinkering2.config import Config, RewardType, TrainingMode
+from tinker_cookbook.utils import ml_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,3 +126,51 @@ def save_rollouts_to_file(
             f.write("\n")
 
     logger.info(f"Saved rollouts to {filepath}")
+
+
+def get_reward_from_scores(scores: dict, reward_type: RewardType) -> float:
+    """Get the appropriate reward value based on reward_type configuration."""
+    if reward_type == RewardType.FULL_STRICT:
+        return float(scores["prompt_strict"])
+    elif reward_type == RewardType.FULL_LOOSE:
+        return float(scores["prompt_loose"])
+    elif reward_type == RewardType.PARTIAL_STRICT:
+        return float(scores["instruction_strict"])
+    elif reward_type == RewardType.PARTIAL_LOOSE:
+        return float(scores["instruction_loose"])
+    else:
+        raise ValueError(f"Unknown reward_type: {reward_type}")
+
+
+def get_run_name(config: Config) -> str:
+    """Generate a descriptive run name based on config parameters."""
+    model_short = config.model.split("/")[-1]
+    name = (
+        f"{model_short}_bs{config.batch_size}_lr{config.learning_rate:.0e}"
+        f"_r{config.rollouts}_lora{config.lora_rank}"
+    )
+    if config.advantage_std_norm:
+        name += "_stdnorm"
+    if config.use_clipping:
+        name += "_clip"
+        if config.clip_higher:
+            name += "-higher"
+    if config.kl_penalty_coef > 0:
+        name += f"_kl{config.kl_penalty_coef}"
+    if config.training_mode == TrainingMode.ASYNC:
+        name += f"_async{config.async_max_staleness}"
+    if config.dynamic_sampling:
+        name += "_dynsamp"
+    return name
+
+
+def setup_logging(config: Config):
+    run_name = get_run_name(config)
+    log_path = f"./logs/{run_name}"
+    return ml_log.setup_logging(
+        log_dir=log_path,
+        wandb_project=config.wandb_project,
+        wandb_name=run_name,
+        config=config,
+        do_configure_logging_module=True,
+    )
