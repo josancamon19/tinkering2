@@ -1,7 +1,7 @@
 from tinkering2.config import Config, Row
 from tinkering2.dataset.ifbench.simple_eval import evaluate_output, strip_thinking
 from tinker import types
-from tinker import tinker
+import tinker
 import asyncio
 import time
 import logging
@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def run(
+async def run(
     config: Config,
     renderer,
     test_data: list[Row],
@@ -40,7 +40,8 @@ def run(
     instruction_loose_sum = 0.0
 
     for sample_future, item in zip(all_samples, test_data):
-        sample_result = sample_future.result()
+        # Wrap concurrent.futures.Future to make it asyncio-awaitable
+        sample_result = await asyncio.wrap_future(sample_future)
         seq_tokens = sample_result.sequences[0].tokens
 
         parsed_response, _ = renderer.parse_response(seq_tokens)

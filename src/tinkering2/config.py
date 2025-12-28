@@ -1,8 +1,7 @@
 import enum
-from chz import chz
 from tinker_cookbook.utils.trace import dataclass
 from typing import Any
-
+import chz
 
 class RewardType(enum.Enum):
     FULL_STRICT = "full_strict"
@@ -65,6 +64,7 @@ class Config:
     # consistent effective batch sizes while avoiding wasted compute.
     # When enabled, filter_zero_advantage is implicitly True. Most benefitial when binary rewards and easy/hard dominate
     # TODO: with small data it'd be repeating some too often, no? specially as most prompts are hard
+    # TODO: I think there's an async code issue with dynamic sampling
     dynamic_sampling: bool = False
     # Maximum rounds of extra sampling to try before giving up
     dynamic_sampling_max_retries: int = 3

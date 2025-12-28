@@ -4,7 +4,6 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any
 import chz
 import asyncio
 import random
@@ -117,7 +116,7 @@ async def _generate_rollouts_for_batch(
         grouped_instruction_results: list[list] = []
         ob_len = len(prompt_tokens) - 1
 
-        for sequence in (samples.result()).sequences:
+        for sequence in (await asyncio.wrap_future(samples)).sequences:
             seq_logprobs = sequence.logprobs
             seq_tokens = sequence.tokens
 
@@ -494,7 +493,7 @@ async def main(config: Config):
 
         # Run evaluation periodically
         if batch_idx % config.eval_every == 0:
-            eval_acc, _ = run_eval(
+            eval_acc, _ = await run_eval(
                 config,
                 renderer,
                 test_data,
@@ -633,25 +632,26 @@ async def main(config: Config):
             )
 
         # Choose loss function based on clipping config
+        # Use async versions to allow sampling tasks to run concurrently during training
         if config.use_clipping:
             loss_fn = "ppo"
             loss_fn_config = {
                 "clip_low_threshold": 0.8,
                 "clip_high_threshold": 1.28 if config.clip_higher else 1.2,
             }
-            fwd_bwd_future = training_client.forward_backward(
+            fwd_bwd_future = await training_client.forward_backward_async(
                 training_datums,
                 loss_fn,
                 loss_fn_config=loss_fn_config,
             )
         else:
-            fwd_bwd_future = training_client.forward_backward(
+            fwd_bwd_future = await training_client.forward_backward_async(
                 training_datums,
                 "importance_sampling",
             )
-        optim_step_future = training_client.optim_step(adam_params)
-        fwd_bwd_result = fwd_bwd_future.result()
-        _optim_result = optim_step_future.result()
+        optim_step_future = await training_client.optim_step_async(adam_params)
+        fwd_bwd_result = await fwd_bwd_future.result_async()
+        _optim_result = await optim_step_future.result_async()
 
         # Log metrics
         metrics["time/total"] = time.time() - t_start
@@ -722,13 +722,13 @@ async def main(config: Config):
         logger.info(log_msg)
 
     # Final evaluation
-    sampling_client = training_client.save_weights_and_get_sampling_client()
-    run_eval(
+    sampling_client = await training_client.save_weights_and_get_sampling_client_async()
+    await run_eval(
         config,
         renderer,
         test_data,
         sampling_client,
-        final_step + 1,  # Use actual stopping point, not total batches
+        final_step + 1,
         ml_logger,
     )
 
