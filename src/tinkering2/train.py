@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
@@ -86,6 +86,7 @@ class Config:
     # Set to False if you want consistent batch sizes for optimizer/scheduler stability,
     # though this comes at the cost of wasted compute on zero-gradient samples.
     filter_zero_advantage: bool = True
+    # TODO: option to run dynamic sampling as well
 
     # - KL penalty options (uses Tinker's incorporate_kl_penalty)
     # Computes KL divergence against a frozen base model and adjusts advantages.
@@ -99,12 +100,11 @@ class Config:
     # Note: DAPO removes KL penalty entirely since reasoning models need to diverge
     # significantly from the base model. Consider disabling for reasoning tasks.
     kl_penalty_coef: float = 0.0  # Set > 0 to enable (e.g., 0.01). 0 = disabled.
-    kl_discount_factor: float = (
-        0.0  # Discount factor for future KL (0 = no discounting)
-    )
+    # Discount factor for future KL (0 = no discounting)
+    kl_discount_factor: float = 0.0
 
-    # TODO: dynamic sampling options
     # TODO: offline online async setups
+    # TODO: do we need pass @k as well?
 
 
 @dataclass
@@ -319,7 +319,7 @@ async def main(config: Config):
             and batch_idx > 0
             and batch_idx % config.save_every == 0
         ):
-            checkpoint_utils.save_checkpoint(
+            await checkpoint_utils.save_checkpoint_async(
                 training_client=training_client,
                 name=f"{batch_idx:06d}",
                 log_path=log_path,
@@ -596,8 +596,8 @@ async def main(config: Config):
         ml_logger,
     )
 
-    # Save final checkpoint
-    checkpoint_utils.save_checkpoint(
+    # Save final checkpoint (use async version since we're in async context)
+    await checkpoint_utils.save_checkpoint_async(
         training_client=training_client,
         name="final",
         log_path=log_path,
