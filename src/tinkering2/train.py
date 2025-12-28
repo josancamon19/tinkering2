@@ -37,6 +37,11 @@ class RewardType(enum.Enum):
     PARTIAL_LOOSE = "partial_loose"
 
 
+class TrainingMode(enum.Enum):
+    ONLINE = "online"  # Synchronous: sample with current policy, then train
+    ASYNC = "async"  # Pipelined: sample with θ_{t-1} while training θ_t (1-step delay)
+
+
 def get_reward_from_scores(scores: dict, reward_type: RewardType) -> float:
     """Get the appropriate reward value based on reward_type configuration."""
     if reward_type == RewardType.FULL_STRICT:
@@ -112,8 +117,11 @@ class Config:
     # Discount factor for future KL (0 = no discounting)
     kl_discount_factor: float = 0.0
 
-    # TODO: offline online async setups
+    # Training mode: online (sync) vs async (pipelined with 1-step delay)
+    training_mode: TrainingMode = TrainingMode.ONLINE
+
     # TODO: do we need pass @k as well?
+    # TODO: check deeper seed values
 
 
 @dataclass
@@ -139,6 +147,8 @@ def _get_run_name(config: Config) -> str:
             name += "-higher"
     if config.kl_penalty_coef > 0:
         name += f"_kl{config.kl_penalty_coef}"
+    if config.training_mode == TrainingMode.ASYNC:
+        name += "_async"
     return name
 
 
@@ -255,6 +265,165 @@ def _run_eval(
     return metrics["eval/prompt_strict_acc"], metrics
 
 
+@dataclass
+class RolloutBatchResult:
+    """Result of generating rollouts for a batch."""
+
+    training_datums: list[types.Datum]
+    batch_rewards: list[float]
+    all_logprobs_flat: list[float]
+    batch_rollouts: list[SampleRollouts]
+
+
+async def _generate_rollouts_for_batch(
+    config: Config,
+    batch: list[Row],
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    sampling_params: tinker.SamplingParams,
+) -> RolloutBatchResult:
+    """Generate rollouts for a batch and compute rewards/advantages.
+
+    This is extracted to enable async pipelining - we can start generating
+    rollouts for batch N+1 while training on batch N.
+    """
+    all_samples: list[asyncio.Future[types.SampleResponse]] = []
+    all_prompts: list[list[int]] = []
+    batch_rewards: list[float] = []
+    all_logprobs_flat: list[float] = []
+    batch_rollouts: list[SampleRollouts] = []
+
+    # Start all sampling requests
+    for item in batch:
+        messages = [{"role": "user", "content": item.prompt}]
+        model_input = renderer.build_generation_prompt(messages)
+        samples: asyncio.Future[types.SampleResponse] = sampling_client.sample(
+            model_input, config.rollouts, sampling_params
+        )
+        all_samples.append(samples)
+        all_prompts.append(model_input.to_ints())
+
+    training_datums: list[types.Datum] = []
+    for sample_idx, (samples, prompt_tokens, inputs) in enumerate(
+        zip(all_samples, all_prompts, batch)
+    ):
+        grouped_tokens: list[list[int]] = []
+        grouped_logprobs: list[list[float]] = []
+        grouped_rewards: list[float] = []
+        grouped_responses: list[str] = []
+        grouped_scores: list[dict] = []
+        grouped_instruction_results: list[list] = []
+        ob_len = len(prompt_tokens) - 1
+
+        for sequence in (samples.result()).sequences:
+            seq_logprobs = sequence.logprobs
+            seq_tokens = sequence.tokens
+
+            parsed_response, _ = renderer.parse_response(seq_tokens)
+            content = parsed_response["content"]
+            content = strip_thinking(content).replace("<|im_end|>", "").strip()
+            instruction_results, scores = evaluate_output(
+                content, inputs.instruction_id_list, inputs.kwargs, inputs.prompt
+            )
+            score: float = get_reward_from_scores(scores, config.reward_type)
+
+            grouped_tokens.append(prompt_tokens + seq_tokens)
+            grouped_logprobs.append(seq_logprobs)
+            grouped_rewards.append(score)
+            grouped_responses.append(content)
+            grouped_scores.append(scores)
+            grouped_instruction_results.append(
+                [
+                    (r.instruction_id, r.strict_pass, r.loose_pass)
+                    for r in instruction_results
+                ]
+            )
+
+            if seq_logprobs:
+                all_logprobs_flat.extend(seq_logprobs)
+
+        mean_reward = sum(grouped_rewards) / len(grouped_rewards)
+        batch_rewards.append(mean_reward)
+
+        # Compute advantages
+        if config.advantage_std_norm:
+            variance = sum((r - mean_reward) ** 2 for r in grouped_rewards) / len(
+                grouped_rewards
+            )
+            std_reward = variance**0.5
+            grouped_advantages = [
+                (r - mean_reward) / (std_reward + 1e-8) for r in grouped_rewards
+            ]
+        else:
+            grouped_advantages = [reward - mean_reward for reward in grouped_rewards]
+
+        # Collect rollout info for logging
+        sample_rollouts = SampleRollouts(
+            sample_idx=sample_idx,
+            prompt=inputs.prompt,
+            instruction_id_list=inputs.instruction_id_list,
+            mean_reward=mean_reward,
+            rollouts=[
+                RolloutInfo(
+                    rollout_idx=i,
+                    response=resp,
+                    reward=rew,
+                    advantage=adv,
+                    scores=sc,
+                    instruction_results=ir,
+                )
+                for i, (resp, rew, adv, sc, ir) in enumerate(
+                    zip(
+                        grouped_responses,
+                        grouped_rewards,
+                        grouped_advantages,
+                        grouped_scores,
+                        grouped_instruction_results,
+                    )
+                )
+            ],
+        )
+        batch_rollouts.append(sample_rollouts)
+
+        # Skip prompts with zero variance if filtering is enabled
+        if config.filter_zero_advantage and all(
+            adv == 0.0 for adv in grouped_advantages
+        ):
+            continue
+
+        for tokens, logprobs, advantage in zip(
+            grouped_tokens, grouped_logprobs, grouped_advantages
+        ):
+            input_tokens = [int(t) for t in tokens[:-1]]
+            target_tokens = tokens[1:]
+            all_logprobs = [0.0] * ob_len + logprobs
+            all_advantages = [0.0] * ob_len + [advantage] * (len(input_tokens) - ob_len)
+
+            loss_fn_inputs = {
+                "target_tokens": TensorData.from_torch(torch.tensor(target_tokens)),
+                "logprobs": TensorData.from_torch(torch.tensor(all_logprobs)),
+                "advantages": TensorData.from_torch(torch.tensor(all_advantages)),
+            }
+
+            if config.kl_penalty_coef > 0:
+                all_mask = [0.0] * ob_len + [1.0] * (len(input_tokens) - ob_len)
+                loss_fn_inputs["mask"] = TensorData.from_torch(torch.tensor(all_mask))
+
+            training_datums.append(
+                types.Datum(
+                    model_input=types.ModelInput.from_ints(tokens=input_tokens),
+                    loss_fn_inputs=loss_fn_inputs,
+                )
+            )
+
+    return RolloutBatchResult(
+        training_datums=training_datums,
+        batch_rewards=batch_rewards,
+        all_logprobs_flat=all_logprobs_flat,
+        batch_rollouts=batch_rollouts,
+    )
+
+
 async def main(config: Config):
     # Setup logging
     ml_logger = _setup_logging(config)
@@ -308,11 +477,42 @@ async def main(config: Config):
         base_model=config.model
     )
 
-    final_step = 0
+    # Build list of (batch_idx, batch_data) tuples, skipping already completed batches
+    batch_items: list[tuple[int, list[Row]]] = []
     for batch_idx, start_idx in enumerate(range(0, len(train_data), config.batch_size)):
-        # Skip batches we've already completed when resuming
         if batch_idx < start_batch:
             continue
+        batch = train_data[
+            start_idx : min(len(train_data), start_idx + config.batch_size)
+        ]
+        batch_items.append((batch_idx, batch))
+
+    if config.training_mode == TrainingMode.ASYNC:
+        logger.info("Using ASYNC (pipelined) training mode with 1-step policy delay")
+    else:
+        logger.info("Using ONLINE (synchronous) training mode")
+
+    # For async mode: pre-fetch first batch's rollouts
+    pending_rollout_task: asyncio.Task[RolloutBatchResult] | None = None
+    pending_batch_idx: int | None = None
+
+    if config.training_mode == TrainingMode.ASYNC and len(batch_items) > 0:
+        # Get initial sampling client and start first batch
+        sampling_client = training_client.save_weights_and_get_sampling_client()
+        first_batch_idx, first_batch = batch_items[0]
+        pending_rollout_task = asyncio.create_task(
+            _generate_rollouts_for_batch(
+                config, first_batch, sampling_client, renderer, sampling_params
+            )
+        )
+        pending_batch_idx = first_batch_idx
+
+    final_step = 0
+    early_stop = False
+
+    for i, (batch_idx, batch) in enumerate(batch_items):
+        if early_stop:
+            break
 
         final_step = batch_idx
         t_start = time.time()
@@ -337,11 +537,8 @@ async def main(config: Config):
             )
             logger.info(f"Saved checkpoint at batch {batch_idx}")
 
-        batch = train_data[
-            start_idx : min(len(train_data), start_idx + config.batch_size)
-        ]
-
-        sampling_client = training_client.save_weights_and_get_sampling_client()
+        # Get current sampling client for eval (always use fresh weights for eval)
+        eval_sampling_client = training_client.save_weights_and_get_sampling_client()
 
         # Run evaluation periodically
         if batch_idx % config.eval_every == 0:
@@ -349,7 +546,7 @@ async def main(config: Config):
                 config,
                 renderer,
                 test_data,
-                sampling_client,
+                eval_sampling_client,
                 batch_idx,
                 ml_logger,
             )
@@ -371,151 +568,46 @@ async def main(config: Config):
                     f"Early stopping triggered after {evals_without_improvement} "
                     f"evaluations without improvement. Best accuracy: {best_eval_acc:.3f}"
                 )
+                early_stop = True
                 break
 
-        all_samples: list[asyncio.Future[types.SampleResponse]] = []
-        all_prompts: list[list[int]] = []
-        batch_rewards: list[float] = []
-        all_logprobs_flat: list[float] = []  # For entropy computation
+        # === Get rollouts for current batch ===
+        if config.training_mode == TrainingMode.ASYNC:
+            # ASYNC mode: await the pre-fetched rollouts
+            assert pending_rollout_task is not None
+            assert pending_batch_idx == batch_idx
+            rollout_result = await pending_rollout_task
 
-        # For rollout logging
-        batch_rollouts: list[SampleRollouts] = []
-
-        for item in batch:
-            messages = [{"role": "user", "content": item.prompt}]
-            model_input = renderer.build_generation_prompt(messages)
-            samples: asyncio.Future[types.SampleResponse] = sampling_client.sample(
-                model_input, config.rollouts, sampling_params
-            )
-            all_samples.append(samples)
-            all_prompts.append(model_input.to_ints())
-
-        training_datums: list[types.Datum] = []
-        for sample_idx, (samples, prompt_tokens, inputs) in enumerate(
-            zip(all_samples, all_prompts, batch)
-        ):
-            grouped_tokens: list[list[int]] = []
-            grouped_logprobs: list[list[float]] = []
-            grouped_rewards: list[float] = []
-            grouped_responses: list[str] = []  # Store responses for logging
-            grouped_scores: list[dict] = []  # Store full scores for logging
-            grouped_instruction_results: list[
-                list
-            ] = []  # Store instruction results for logging
-            ob_len = len(prompt_tokens) - 1
-
-            for sequence in (samples.result()).sequences:
-                seq_logprobs = sequence.logprobs
-                seq_tokens = sequence.tokens
-
-                parsed_response, _ = renderer.parse_response(seq_tokens)
-                content = parsed_response["content"]
-                content = strip_thinking(content).replace("<|im_end|>", "").strip()
-                instruction_results, scores = evaluate_output(
-                    content, inputs.instruction_id_list, inputs.kwargs, inputs.prompt
+            # Start generating NEXT batch's rollouts immediately (1-step stale policy)
+            # The sampling_client here uses weights from BEFORE training this batch
+            if i + 1 < len(batch_items):
+                next_batch_idx, next_batch = batch_items[i + 1]
+                # Use eval_sampling_client which has current weights
+                # (will be 1-step stale when we use these rollouts next iteration)
+                pending_rollout_task = asyncio.create_task(
+                    _generate_rollouts_for_batch(
+                        config,
+                        next_batch,
+                        eval_sampling_client,
+                        renderer,
+                        sampling_params,
+                    )
                 )
-                score: float = get_reward_from_scores(scores, config.reward_type)
-
-                grouped_tokens.append(prompt_tokens + seq_tokens)
-                grouped_logprobs.append(seq_logprobs)
-                grouped_rewards.append(score)
-                grouped_responses.append(content)
-                grouped_scores.append(scores)
-                grouped_instruction_results.append(
-                    [
-                        (r.instruction_id, r.strict_pass, r.loose_pass)
-                        for r in instruction_results
-                    ]
-                )
-
-                # Collect logprobs for entropy computation
-                if seq_logprobs:
-                    all_logprobs_flat.extend(seq_logprobs)
-
-            mean_reward = sum(grouped_rewards) / len(grouped_rewards)
-            batch_rewards.append(mean_reward)
-
-            # Compute advantages with optional std normalization (GRPO-style)
-            if config.advantage_std_norm:
-                # GRPO: A_i = (r_i - mean) / std
-                variance = sum((r - mean_reward) ** 2 for r in grouped_rewards) / len(
-                    grouped_rewards
-                )
-                std_reward = variance**0.5
-                # Add small epsilon to avoid division by zero
-                grouped_advantages = [
-                    (r - mean_reward) / (std_reward + 1e-8) for r in grouped_rewards
-                ]
+                pending_batch_idx = next_batch_idx
             else:
-                grouped_advantages = [
-                    reward - mean_reward for reward in grouped_rewards
-                ]
-
-            # Collect rollout info for logging (before filtering zero advantages)
-            sample_rollouts = SampleRollouts(
-                sample_idx=sample_idx,
-                prompt=inputs.prompt,
-                instruction_id_list=inputs.instruction_id_list,
-                mean_reward=mean_reward,
-                rollouts=[
-                    RolloutInfo(
-                        rollout_idx=i,
-                        response=resp,
-                        reward=rew,
-                        advantage=adv,
-                        scores=sc,
-                        instruction_results=ir,
-                    )
-                    for i, (resp, rew, adv, sc, ir) in enumerate(
-                        zip(
-                            grouped_responses,
-                            grouped_rewards,
-                            grouped_advantages,
-                            grouped_scores,
-                            grouped_instruction_results,
-                        )
-                    )
-                ],
+                pending_rollout_task = None
+                pending_batch_idx = None
+        else:
+            # ONLINE mode: generate rollouts synchronously with current policy
+            sampling_client = training_client.save_weights_and_get_sampling_client()
+            rollout_result = await _generate_rollouts_for_batch(
+                config, batch, sampling_client, renderer, sampling_params
             )
-            batch_rollouts.append(sample_rollouts)
 
-            # Skip prompts with zero variance (all advantages = 0) if filtering is enabled.
-            # These contribute no gradient signal, so including them just wastes compute.
-            if config.filter_zero_advantage and all(
-                adv == 0.0 for adv in grouped_advantages
-            ):
-                continue
-
-            for tokens, logprobs, advantage in zip(
-                grouped_tokens, grouped_logprobs, grouped_advantages
-            ):
-                input_tokens = [int(t) for t in tokens[:-1]]
-                target_tokens = tokens[1:]
-                all_logprobs = [0.0] * ob_len + logprobs
-                all_advantages = [0.0] * ob_len + [advantage] * (
-                    len(input_tokens) - ob_len
-                )
-
-                loss_fn_inputs = {
-                    "target_tokens": TensorData.from_torch(torch.tensor(target_tokens)),
-                    "logprobs": TensorData.from_torch(torch.tensor(all_logprobs)),
-                    "advantages": TensorData.from_torch(torch.tensor(all_advantages)),
-                }
-
-                # Add mask only if using KL penalty (required by incorporate_kl_penalty)
-                # The mask is NOT used by loss functions - Tinker strips it before training
-                if config.kl_penalty_coef > 0:
-                    all_mask = [0.0] * ob_len + [1.0] * (len(input_tokens) - ob_len)
-                    loss_fn_inputs["mask"] = TensorData.from_torch(
-                        torch.tensor(all_mask)
-                    )
-
-                training_datums.append(
-                    types.Datum(
-                        model_input=types.ModelInput.from_ints(tokens=input_tokens),
-                        loss_fn_inputs=loss_fn_inputs,
-                    )
-                )
+        training_datums = rollout_result.training_datums
+        batch_rewards = rollout_result.batch_rewards
+        all_logprobs_flat = rollout_result.all_logprobs_flat
+        batch_rollouts = rollout_result.batch_rollouts
 
         # Save rollouts for debugging (save every N steps to avoid too many files)
         log_dir = Path(log_path)
@@ -531,10 +623,6 @@ async def main(config: Config):
             continue
 
         # Apply KL penalty against base model if configured
-        # This uses Tinker's incorporate_kl_penalty which:
-        # 1. Computes logprobs from frozen base model
-        # 2. Calculates KL = logp_sampled - logp_base per token
-        # 3. Adjusts advantages: advantage += coef * (avg_kl - per_token_kl)
         kl_metrics: dict[str, float] = {}
         if config.kl_penalty_coef > 0:
             kl_metrics = await incorporate_kl_penalty(
@@ -572,33 +660,35 @@ async def main(config: Config):
         )
 
         # Entropy metrics (using -mean(logprobs) as proxy)
-        # Lower values = more confident/collapsed, Higher values = more exploratory
         if all_logprobs_flat:
             mean_logprob = sum(all_logprobs_flat) / len(all_logprobs_flat)
             metrics["entropy/mean_logprob"] = mean_logprob
-            metrics["entropy/proxy"] = -mean_logprob  # Higher = more entropy
-            # Also compute min/max logprobs to see the range
+            metrics["entropy/proxy"] = -mean_logprob
             metrics["entropy/min_logprob"] = min(all_logprobs_flat)
             metrics["entropy/max_logprob"] = max(all_logprobs_flat)
 
-        # KL penalty metrics (from Tinker's incorporate_kl_penalty)
+        # KL penalty metrics
         if kl_metrics:
             metrics.update({f"kl/{k}": v for k, v in kl_metrics.items()})
             metrics["kl/coef"] = config.kl_penalty_coef
 
-        # Forward backward result has a metrics dict, not a loss attribute
         metrics.update({f"train/{k}": v for k, v in fwd_bwd_result.metrics.items()})
         metrics["train/num_datums"] = len(training_datums)
-        # Add normalized loss (per-datum average) for easier interpretation
         loss_sum = fwd_bwd_result.metrics.get("loss:sum", 0.0)
         metrics["train/loss_per_datum"] = (
             loss_sum / len(training_datums) if training_datums else 0.0
         )
+
+        # Track async-specific metrics
+        if config.training_mode == TrainingMode.ASYNC:
+            metrics["async/policy_staleness"] = 1  # 1-step delay
+
         ml_logger.log_metrics(metrics, step=batch_idx)
 
         # Build log message
+        mode_tag = "[async]" if config.training_mode == TrainingMode.ASYNC else ""
         log_msg = (
-            f"Batch {batch_idx}/{n_train_batches} | "
+            f"Batch {batch_idx}/{n_train_batches} {mode_tag}| "
             f"reward={metrics['reward/mean']:.3f} | "
             f"loss/datum={metrics['train/loss_per_datum']:.2f} | "
             f"datums={len(training_datums)} | "
