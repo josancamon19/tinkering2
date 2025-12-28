@@ -21,7 +21,12 @@ from tinker.types.tensor_data import TensorData
 from tinkering2.dataset.ifbench.simple_eval import evaluate_output, strip_thinking
 import enum
 
-from tinkering2.utils import SampleRollouts, RolloutInfo, save_rollouts_to_file
+from tinkering2.utils import (
+    SampleRollouts,
+    RolloutInfo,
+    save_rollouts_to_file,
+    set_seed,
+)
 
 _HERE = Path(__file__).parent
 
@@ -89,6 +94,7 @@ class Config:
     # rewards are 0/1 (e.g., 15/16 correct → std≈0.25 → 4x amplified advantages).
     # Enable for continuous rewards (PARTIAL_*) or to match original GRPO paper.
     advantage_std_norm: bool = False
+    # TODO: implement batch level std, reinforce++, Liteppo
 
     # - clipping options
     use_clipping: bool = False  # default ppo clipping, 1-0.2, 1+0.2
@@ -438,7 +444,7 @@ async def main(config: Config):
     with open(data_path) as f:
         data = [json.loads(line) for line in f.readlines()]
 
-    random.seed(config.seed)
+    set_seed(config.seed)
     random.shuffle(data)
 
     data = [
@@ -592,8 +598,12 @@ async def main(config: Config):
         current_staleness = 0  # For logging
         if config.training_mode == TrainingMode.ASYNC:
             # ASYNC mode: pop the oldest pre-fetched rollouts from the deque
-            assert len(pending_rollouts) > 0, f"No pending rollouts for batch {batch_idx}"
-            popped_batch_idx, current_staleness, rollout_task = pending_rollouts.popleft()
+            assert len(pending_rollouts) > 0, (
+                f"No pending rollouts for batch {batch_idx}"
+            )
+            popped_batch_idx, current_staleness, rollout_task = (
+                pending_rollouts.popleft()
+            )
             assert popped_batch_idx == batch_idx, (
                 f"Batch mismatch: expected {batch_idx}, got {popped_batch_idx}"
             )
