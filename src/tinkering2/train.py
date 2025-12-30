@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
+# TODO: entropy log is definitely wrong.
 async def _get_new_or_resume(
     config: Config, service_client: tinker.ServiceClient, log_path: str
 ) -> tuple[tinker.TrainingClient, int]:
